@@ -2,8 +2,6 @@ import os
 import sqlite3
 import json
 from typing import Dict, List
-import tkinter as tk
-from tkinter import filedialog, ttk
 import whisper
 from pyannote.audio import Pipeline
 import torch
@@ -11,7 +9,7 @@ import numpy as np
 from transformers import pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from config import DATABASE_PATH, WHISPER_MODEL_SIZE, SUMMARIZER_MODEL, SIMILARITY_THRESHOLD
+from collections import defaultdict
 
 class LectureNotesGenerator:
     def __init__(self, auth_token: str):
@@ -19,15 +17,18 @@ class LectureNotesGenerator:
         Initialize the notes generator.
         auth_token: HuggingFace token for pyannote.audio access
         """
-        self.database_path = DATABASE_PATH
+        self.database_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'notes.db')
+        
         # Initialize Whisper
-        self.whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
+        self.whisper_model = whisper.load_model("small")
+        
         # Initialize speaker diarization
         self.diarization = Pipeline.from_pretrained(
             "pyannote/speaker-diarization",
             use_auth_token=auth_token
         )
-        self.summarizer = pipeline("summarization", model=SUMMARIZER_MODEL)
+        
+        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
         self.vectorizer = TfidfVectorizer()
     
     def transcribe_with_speakers(self, audio_path: str) -> List[Dict]:
@@ -52,98 +53,125 @@ class LectureNotesGenerator:
                     "speaker": speaker,
                     "start": turn.start,
                     "end": turn.end,
-                    "text": result["text"].strip()
+                    "text": result["text"].strip(),
+                    "duration": turn.end - turn.start
                 })
             return segments
         except Exception as e:
             print(f"Error transcribing audio: {str(e)}")
             return []
 
-    def format_transcript(self, segments: List[Dict]) -> str:
-        """Convert segmented transcription into formatted text."""
-        formatted_text = []
-        current_speaker = None
+    def identify_main_lecturer(self, segments: List[Dict]) -> str:
+        """
+        Identify the main lecturer based on speaking time and consistency of content.
+        """
+        # Count total speaking time for each speaker
+        speaker_duration = defaultdict(float)
+        speaker_segments = defaultdict(list)
         
         for segment in segments:
-            if segment["speaker"] != current_speaker:
-                current_speaker = segment["speaker"]
-                formatted_text.append(f"\n[{current_speaker}]: ")
-            formatted_text.append(segment["text"])
+            speaker_duration[segment['speaker']] += segment['duration']
+            speaker_segments[segment['speaker']].append(segment['text'])
+        
+        # Find speaker with most speaking time
+        main_lecturer = max(speaker_duration, key=speaker_duration.get)
+        
+        # Optional: Validate main lecturer by text cohesiveness
+        def get_text_cohesiveness(texts):
+            """Measure how related the texts are using TF-IDF cosine similarity"""
+            if len(texts) <= 1:
+                return 0
+            
+            vectorizer = TfidfVectorizer()
+            tfidf_matrix = vectorizer.fit_transform(texts)
+            
+            # Calculate pairwise similarities
+            similarities = cosine_similarity(tfidf_matrix)
+            
+            # Average similarity excluding diagonal (self-similarity)
+            return np.mean([
+                similarities[i,j] 
+                for i in range(similarities.shape[0]) 
+                for j in range(similarities.shape[0]) 
+                if i != j
+            ])
+        
+        # Get text cohesiveness for potential main lecturers
+        speaker_cohesiveness = {
+            speaker: get_text_cohesiveness(texts)
+            for speaker, texts in speaker_segments.items()
+        }
+        
+        # Find speaker with both long speaking time and high text cohesiveness
+        main_lecturer_candidates = {
+            speaker: speaker_duration[speaker] * (1 + cohesiveness)
+            for speaker, cohesiveness in speaker_cohesiveness.items()
+        }
+        
+        return max(main_lecturer_candidates, key=main_lecturer_candidates.get)
+
+    def format_transcript(self, segments: List[Dict], main_lecturer: str) -> str:
+        """Convert segmented transcription into formatted text, highlighting main lecturer."""
+        formatted_text = []
+        
+        for segment in segments:
+            speaker_prefix = "[LECTURER] " if segment["speaker"] == main_lecturer else "[OTHER] "
+            formatted_text.append(f"{speaker_prefix}{segment['text']}")
         
         return " ".join(formatted_text)
 
-    def get_speaker_summary(self, segments: List[Dict]) -> Dict[str, str]:
-        """Generate summaries for each speaker's contributions."""
-        speaker_texts = {}
+    def get_speaker_summary(self, segments: List[Dict], main_lecturer: str) -> Dict[str, str]:
+        """Generate summaries for main lecturer and other speakers."""
+        speaker_texts = defaultdict(list)
         
         # Group text by speaker
         for segment in segments:
-            if segment["speaker"] not in speaker_texts:
-                speaker_texts[segment["speaker"]] = []
             speaker_texts[segment["speaker"]].append(segment["text"])
         
-        # Summarize each speaker's content
+        # Summarize contents
         summaries = {}
         for speaker, texts in speaker_texts.items():
             combined_text = " ".join(texts)
+            
+            # Adjust summary length based on total text
+            max_length = min(max(130, len(combined_text.split()) // 3), 300)
+            min_length = max(30, max_length // 3)
+            
             if len(combined_text.split()) > 30:
-                summary = self.summarizer(combined_text, 
-                                       max_length=130, 
-                                       min_length=30)[0]["summary_text"]
-                summaries[speaker] = summary
+                summary = self.summarizer(
+                    combined_text, 
+                    max_length=max_length, 
+                    min_length=min_length
+                )[0]["summary_text"]
+                
+                # Prefix for main lecturer
+                speaker_label = "MAIN LECTURER" if speaker == main_lecturer else "OTHER SPEAKER"
+                summaries[speaker_label] = summary
             else:
                 summaries[speaker] = combined_text
                 
         return summaries
-    
-    def get_relevant_notes(self, transcript: str) -> List[Dict]:
-        """Retrieve relevant existing notes based on transcript content."""
-        conn = sqlite3.connect(self.database_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT topic, content FROM notes")
-        existing_notes = cursor.fetchall()
-        
-        # Convert transcript and existing notes to TF-IDF vectors
-        documents = [transcript] + [note[1] for note in existing_notes]
-        tfidf_matrix = self.vectorizer.fit_transform(documents)
-        
-        # Calculate similarity between transcript and each note
-        similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:])
-        
-        # Get most relevant notes (similarity > SIMILARITY_THRESHOLD)
-        relevant_notes = []
-        for idx, similarity in enumerate(similarities[0]):
-            if similarity > SIMILARITY_THRESHOLD:
-                relevant_notes.append({
-                    "topic": existing_notes[idx][0],
-                    "content": existing_notes[idx][1],
-                    "similarity": float(similarity)
-                })
-        
-        conn.close()
-        return sorted(relevant_notes, key=lambda x: x["similarity"], reverse=True)
     
     def generate_notes(self, audio_path: str) -> Dict:
         """Generate structured notes from audio with speaker recognition."""
         # Get transcription with speaker diarization
         segments = self.transcribe_with_speakers(audio_path)
         
-        # Format full transcript
-        full_transcript = self.format_transcript(segments)
+        # Identify main lecturer
+        main_lecturer = self.identify_main_lecturer(segments)
+        
+        # Format full transcript highlighting main lecturer
+        full_transcript = self.format_transcript(segments, main_lecturer)
         
         # Get speaker-specific summaries
-        speaker_summaries = self.get_speaker_summary(segments)
-        
-        # Get relevant existing notes
-        relevant_notes = self.get_relevant_notes(full_transcript)
+        speaker_summaries = self.get_speaker_summary(segments, main_lecturer)
         
         # Combine everything into structured notes
         notes = {
+            "main_lecturer": main_lecturer,
             "speaker_summaries": speaker_summaries,
             "full_transcript": full_transcript,
-            "relevant_existing_notes": relevant_notes,
-            "segments": segments  # Include original segments for reference
+            "segments": segments
         }
         
         return notes
@@ -164,90 +192,12 @@ class LectureNotesGenerator:
         conn.commit()
         conn.close()
 
-class LectureNotesTool(tk.Tk):
-    def __init__(self, generator: LectureNotesGenerator):
-        super().__init__()
-        self.generator = generator
-        self.title("Lecture Notes Generator")
-        self.geometry("800x600")
-        
-        self.create_widgets()
-        
-    def create_widgets(self):
-        # File selection
-        file_frame = tk.Frame(self)
-        file_frame.pack(pady=10)
-        
-        self.file_entry = ttk.Entry(file_frame, width=50)
-        self.file_entry.pack(side=tk.LEFT)
-        
-        browse_button = ttk.Button(file_frame, text="Browse", command=self.browse_file)
-        browse_button.pack(side=tk.LEFT, padx=10)
-        
-        # Processing button
-        process_button = ttk.Button(self, text="Generate Notes", command=self.process_file)
-        process_button.pack(pady=10)
-        
-        # Output area
-        self.output_text = tk.Text(self, height=20, width=80, font=("Arial", 12))
-        self.output_text.pack(pady=10)
-    
-    def browse_file(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Audio Files", "*.wav;*.mp3;*.flac")])
-        if file_path:
-            self.file_entry.delete(0, tk.END)
-            self.file_entry.insert(0, file_path)
-    
-    def process_file(self):
-        audio_path = self.file_entry.get()
-        if audio_path:
-            try:
-                notes = self.generator.generate_notes(audio_path)
-                self.display_notes(notes)
-                self.generator.save_notes(notes, os.path.splitext(os.path.basename(audio_path))[0])
-            except Exception as e:
-                self.output_text.delete("1.0", tk.END)
-                self.output_text.insert(tk.END, f"Error processing file: {str(e)}")
-        else:
-            self.output_text.delete("1.0", tk.END)
-            self.output_text.insert(tk.END, "Please select an audio file first.")
-    
-    def display_notes(self, notes):
-        self.output_text.delete("1.0", tk.END)
-        
-        # Display speaker summaries
-        self.output_text.insert(tk.END, "Speaker Summaries:\n")
-        for speaker, summary in notes["speaker_summaries"].items():
-            self.output_text.insert(tk.END, f"\n[{speaker}]:\n{summary}\n")
-        
-        self.output_text.insert(tk.END, "\nRelevant Existing Notes:\n")
-        for note in notes["relevant_existing_notes"]:
-            self.output_text.insert(tk.END, f"\nTopic: {note['topic']}\nContent: {note['content']}\nSimilarity: {note['similarity']:.2f}\n")
-        
-        self.output_text.insert(tk.END, f"\nFull Transcript:\n{notes['full_transcript']}")
-
-def main():
-    # Initialize the database
-    init_database()
-    
-    # Get HuggingFace token from environment variable
-    auth_token = os.getenv('HUGGINGFACE_TOKEN')
-    if not auth_token:
-        raise ValueError("Please set HUGGINGFACE_TOKEN environment variable")
-    
-    # Initialize the notes generator
-    generator = LectureNotesGenerator(auth_token=auth_token)
-    
-    # Create and run the GUI application
-    app = LectureNotesTool(generator)
-    app.mainloop()
-
-def init_database():
+def init_database(database_path):
     """Initialize the database and create required tables."""
     # Ensure the data directory exists
-    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(database_path), exist_ok=True)
     
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(database_path)
     cursor = conn.cursor()
     
     cursor.execute("""
@@ -262,6 +212,54 @@ def init_database():
     
     conn.commit()
     conn.close()
+
+def main():
+    # Get HuggingFace token from environment variable
+    auth_token = os.getenv('HUGGINGFACE_TOKEN')
+    if not auth_token:
+        raise ValueError("Please set HUGGINGFACE_TOKEN environment variable")
+    
+    # Database path
+    database_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'notes.db')
+    
+    # Initialize the database
+    init_database(database_path)
+    
+    # Initialize the notes generator
+    generator = LectureNotesGenerator(auth_token=auth_token)
+    
+    # CLI input for audio file
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Generate lecture notes from audio")
+    parser.add_argument("audio_path", help="Path to the audio file")
+    parser.add_argument("--topic", default=None, help="Topic of the lecture (optional)")
+    
+    args = parser.parse_args()
+    
+    # If no topic provided, use filename
+    topic = args.topic or os.path.splitext(os.path.basename(args.audio_path))[0]
+    
+    try:
+        # Generate notes
+        notes = generator.generate_notes(args.audio_path)
+        
+        # Print main lecturer information
+        print("\n--- Lecture Notes ---")
+        print(f"Main Lecturer Identified: {notes['main_lecturer']}")
+        
+        # Print speaker summaries
+        print("\nSpeaker Summaries:")
+        for speaker, summary in notes["speaker_summaries"].items():
+            print(f"\n{speaker}:")
+            print(summary)
+        
+        # Save notes
+        generator.save_notes(notes, topic)
+        print(f"\nNotes saved for topic: {topic}")
+        
+    except Exception as e:
+        print(f"Error processing audio: {str(e)}")
 
 if __name__ == "__main__":
     main()
