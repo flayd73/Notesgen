@@ -4,7 +4,7 @@ import json
 from typing import Dict, List
 import tkinter as tk
 from tkinter import filedialog, ttk
-import openai_whisper as whisper
+import whisper
 from pyannote.audio import Pipeline
 import torch
 import numpy as np
